@@ -403,6 +403,10 @@ class Builder:
     reshape targets, tile multiples, padding) are ``!tosa.shape<N>`` SSA
     operands produced by ``tosa.const_shape``, reductions keep their axis, and
     matmul carries explicit zero-point operands.
+
+    ``generic=True`` emits the quoted generic form (``"tosa.transpose"(...)``)
+    instead of custom assembly for the few ops whose custom syntax differs
+    between IREE 3.12 and 3.13; see ``shape()``.
     """
 
     def __init__(self) -> None:
@@ -423,7 +427,7 @@ class Builder:
         op: str,
         operands: Sequence[Value],
         attrs: Sequence[tuple[str, str]] = (),
-        suffix: str = "",
+        generic: bool = False,
     ) -> Value:
         result = Value(
             next(self._names), tensor_type(shape, dtype), tuple(shape), dtype
@@ -433,10 +437,16 @@ class Builder:
             attr_text = " {" + ", ".join(f"{k} = {v}" for k, v in attrs) + "}"
         operand_text = ", ".join(v.name for v in operands)
         operand_types = ", ".join(v.type for v in operands)
-        self.lines.append(
-            f"  {result.name} = {op} {operand_text}{suffix}{attr_text} : "
-            f"({operand_types}) -> {result.type}"
-        )
+        if generic:
+            self.lines.append(
+                f'  {result.name} = "{op}"({operand_text}){attr_text} : '
+                f"({operand_types}) -> {result.type}"
+            )
+        else:
+            self.lines.append(
+                f"  {result.name} = {op} {operand_text}{attr_text} : "
+                f"({operand_types}) -> {result.type}"
+            )
         return result
 
     def _const(self, literal: str, shape: Sequence[int], dtype: str) -> Value:
@@ -458,8 +468,14 @@ class Builder:
             + ", ".join(str(v) for v in dims)
             + f"]> : tensor<{len(dims)}xindex>"
         )
+        # Emitted in generic (quoted) form on purpose: the custom assembly for
+        # tosa.const_shape changed between IREE 3.12 (`{values = ...}`) and 3.13
+        # (`values(...)`), and neither spelling is accepted by the other.  3.12
+        # is what coralnpu-compiler pins, so the generic form is used to keep
+        # the same kernel valid on both.
         self.lines.append(
-            f"  {result.name} = tosa.const_shape values({literal}) : () -> {result.type}"
+            f'  {result.name} = "tosa.const_shape"() {{values = {literal}}} : '
+            f"() -> {result.type}"
         )
         return result
 
@@ -514,12 +530,17 @@ class Builder:
         perm = tuple(int(p) for p in perms)
         if sorted(perm) != list(range(len(value.shape))):
             raise ValueError(f"invalid permutation {perm} for {value.shape}")
+        # Generic form for the same reason as const_shape: 3.12 writes
+        # `{perms = array<i32: ...>}` and 3.13 writes `perms([...])`.
         return self._emit(
             tuple(value.shape[p] for p in perm),
             value.dtype,
             "tosa.transpose",
             [value],
-            suffix=" perms([" + ", ".join(str(p) for p in perm) + "])",
+            attrs=[
+                ("perms", "array<i32: " + ", ".join(str(p) for p in perm) + ">")
+            ],
+            generic=True,
         )
 
     def tile(self, value: Value, multiples: Sequence[int]) -> Value:
@@ -566,7 +587,8 @@ class Builder:
             ref.dtype,
             "tosa.concat",
             list(values),
-            suffix=f" axis({axis})",
+            attrs=[("axis", f"{axis} : i32")],
+            generic=True,
         )
 
     def cast(self, value: Value, dtype: str) -> Value:
@@ -610,7 +632,8 @@ class Builder:
             value.dtype,
             f"tosa.reduce_{kind}",
             [value],
-            suffix=f" axis({axis})",
+            attrs=[("axis", f"{axis} : i32")],
+            generic=True,
         )
 
     def matmul(self, a: Value, b: Value) -> Value:

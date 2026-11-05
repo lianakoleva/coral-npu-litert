@@ -1,0 +1,264 @@
+# Copyright 2026 Google LLC.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Bazel targets for the Coral NPU LiteRT vendor libraries.
+#
+# Written to live at `//litert/vendors/coralnpu` inside the LiteRT workspace,
+# next to `//litert/vendors/examples`, and to use the same `litert_dynamic_lib`
+# macro so the produced SONAMEs match what the runtime dlopen()s:
+#
+#   bazel build //litert/vendors/coralnpu:coralnpu_compiler_plugin_so
+#   bazel build //litert/vendors/coralnpu:coralnpu_dispatch_so
+#
+# The targets do not depend on `//litert/cc` or on absl: vendor libraries are
+# loaded into the host process and must not drag in a second copy of LiteRT.
+#
+# The CMakeLists.txt in this directory builds the same libraries without Bazel
+# and is the configuration the ABI tests are validated against on macOS and on
+# an aarch64 board.
+
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//litert/build_common:litert_build_defs.bzl", "litert_dynamic_lib")
+
+package(default_visibility = ["//litert:litert_public"])
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+cc_library(
+    name = "coralnpu_common",
+    hdrs = [
+        "common/coralnpu_common.h",
+        "common/coralnpu_subprocess.h",
+    ],
+    deps = [
+        "//litert/c:litert_common",
+        "//litert/c:litert_layout",
+        "//litert/c:litert_model_types",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Compiler plugin
+# ---------------------------------------------------------------------------
+
+cc_library(
+    name = "compile_backend",
+    srcs = ["compiler_plugin/aot_compile_backend.cc"],
+    hdrs = ["compiler_plugin/coralnpu_compile_backend.h"],
+    deps = [
+        ":coralnpu_common",
+        "//litert/c:litert_common",
+    ],
+)
+
+litert_dynamic_lib(
+    name = "coralnpu_compiler_plugin",
+    srcs = [
+        "compiler_plugin/aot_compile_backend.cc",
+        "compiler_plugin/coralnpu_compiler_plugin.cc",
+    ],
+    hdrs = ["//litert/vendors/c:litert_compiler_plugin.h"],
+    export_litert_only = True,
+    linkopts = select({
+        "//litert:windows": [],
+        "//conditions:default": ["-Wl,-rpath,$$ORIGIN"],
+    }),
+    linkstatic = 1,
+    shared_lib_name = "coralnpu_compiler_plugin_so",
+    so_name = "libLiteRtCompilerPlugin_CoralNpu.so",
+    deps = [
+        ":coralnpu_common",
+        "//litert/c:litert_builder_header",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_op_code",
+        "//litert/c/internal:litert_abi_header",
+        "//litert/c/internal:litert_compiler_context_header",
+        "//litert/vendors/c:litert_compiler_plugin_api",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Dispatch library
+# ---------------------------------------------------------------------------
+
+cc_library(
+    name = "dispatch_executor_iface",
+    hdrs = ["dispatch/coralnpu_executor.h"],
+    deps = [
+        ":coralnpu_common",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_tensor_buffer_types",
+        "//litert/c/internal:litert_runtime_context_header",
+        "//litert/vendors/c:litert_dispatch_c_api",
+    ],
+)
+
+cc_library(
+    name = "executor_unavailable",
+    srcs = ["dispatch/coralnpu_executor_unavailable.cc"],
+    deps = [
+        ":coralnpu_common",
+        ":dispatch_executor_iface",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c/internal:litert_runtime_context_header",
+    ],
+)
+
+# The subprocess executor needs no IREE at build time; it shells out to
+# iree-run-module.  Select it by swapping the `:executor_unavailable` dep of
+# `coralnpu_dispatch_lib` for this target.
+cc_library(
+    name = "executor_command",
+    srcs = ["dispatch/coralnpu_executor_command.cc"],
+    deps = [
+        ":coralnpu_common",
+        ":dispatch_executor_iface",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c/internal:litert_runtime_context_header",
+    ],
+)
+
+# Non-dynamic-library piece of the dispatch side, shared by the shipping `.so`
+# and by the ABI tests (which link it directly instead of dlopen()ing).
+cc_library(
+    name = "coralnpu_dispatch_lib",
+    srcs = ["dispatch/coralnpu_dispatch.cc"],
+    deps = [
+        ":coralnpu_common",
+        ":dispatch_executor_iface",
+        ":executor_unavailable",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_tensor_buffer",
+        "//litert/c:litert_tensor_buffer_requirements",
+        "//litert/c:litert_tensor_buffer_types",
+        "//litert/c/internal:litert_runtime_context_header",
+        "//litert/vendors/c:litert_dispatch_c_api",
+    ],
+)
+
+litert_dynamic_lib(
+    name = "coralnpu_dispatch",
+    srcs = [
+        "dispatch/coralnpu_dispatch.cc",
+        "dispatch/coralnpu_executor_unavailable.cc",
+    ],
+    hdrs = ["//litert/vendors/c:litert_dispatch.h"],
+    export_litert_only = True,
+    linkopts = select({
+        "//litert:windows": [],
+        "//conditions:default": ["-Wl,-rpath,$$ORIGIN"],
+    }),
+    linkstatic = 1,
+    shared_lib_name = "coralnpu_dispatch_so",
+    so_name = "libLiteRtDispatch_CoralNpu.so",
+    deps = [
+        ":coralnpu_common",
+        ":dispatch_executor_iface",
+        ":executor_unavailable",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_tensor_buffer",
+        "//litert/c:litert_tensor_buffer_requirements",
+        "//litert/c:litert_tensor_buffer_types",
+        "//litert/c/internal:litert_runtime_context_header",
+        "//litert/vendors/c:litert_dispatch_c_api",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Tests
+#
+# Plain executables with no gtest dependency: the vendor libraries must not
+# depend on LiteRT's C++ libraries, and their tests follow the same rule.
+# ---------------------------------------------------------------------------
+
+cc_test(
+    name = "coralnpu_dispatch_abi_test",
+    srcs = ["tests/coralnpu_dispatch_abi_test.cc"],
+    deps = [
+        ":coralnpu_common",
+        ":coralnpu_dispatch_lib",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_tensor_buffer_types",
+        "//litert/c/internal:litert_runtime_context_header",
+        "//litert/vendors/c:litert_dispatch_c_api",
+    ],
+)
+
+cc_test(
+    name = "coralnpu_compile_backend_test",
+    srcs = ["tests/coralnpu_compile_backend_test.cc"],
+    deps = [
+        ":compile_backend",
+        ":coralnpu_common",
+        "//litert/c:litert_common",
+    ],
+)
+
+cc_test(
+    name = "coralnpu_compiler_plugin_metadata_test",
+    srcs = ["tests/coralnpu_compiler_plugin_metadata_test.cc"],
+    deps = [
+        ":compile_backend",
+        ":coralnpu_common",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c/internal:litert_abi_header",
+        "//litert/c/internal:litert_compiler_context_header",
+        "//litert/vendors/c:litert_compiler_plugin_api",
+    ],
+)
+
+cc_test(
+    name = "coralnpu_command_executor_test",
+    srcs = ["tests/coralnpu_command_executor_test.cc"],
+    deps = [
+        ":coralnpu_common",
+        ":executor_command",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c/internal:litert_runtime_context_header",
+        "//litert/vendors/c:litert_dispatch_c_api",
+    ],
+)
+
+# dlopen()s the real shared object, so this only makes sense where dlfcn.h
+# exists.  On Windows the library path argument is not a usable .dll handle, so
+# the test is expected to be excluded from that configuration.
+cc_test(
+    name = "coralnpu_dlopen_smoke_test",
+    srcs = ["tests/coralnpu_dlopen_smoke_test.cc"],
+    args = ["$(rootpath :coralnpu_dispatch_so)"],
+    data = [":coralnpu_dispatch_so"],
+    linkopts = select({
+        "//litert:windows": [],
+        "//conditions:default": ["-ldl"],
+    }),
+    deps = [
+        ":coralnpu_common",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c/internal:litert_runtime_context_header",
+        "//litert/vendors/c:litert_dispatch_c_api",
+    ],
+)

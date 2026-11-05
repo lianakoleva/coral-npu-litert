@@ -1,0 +1,25 @@
+{
+  "memory": {
+    "tile_bytes": 262144,
+    "stack_bytes": 65536,
+    "safety_factor": 1.25,
+    "reserved_bytes": 4096
+  },
+  "attention": {
+    "causal": true,
+    "layout": "auto"
+  },
+  "target": {
+    "name": "coral-npu",
+    "iree_compile": "iree-compile",
+    "iree_opt": "iree-opt",
+    "iree_import_tflite": "iree-import-tflite",
+    "compile_flags": [
+      "--iree-hal-target-device=local",
+      "--iree-hal-local-target-device-backends=llvm-cpu",
+      "--iree-llvmcpu-target-cpu=host",
+      "--iree-hal-target-device=coralnpu",
+      "--iree-opt-level=O2"
+    ]
+  }
+}

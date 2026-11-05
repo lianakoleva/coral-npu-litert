@@ -79,8 +79,10 @@ DEFAULTS: dict[str, Any] = {
         "iree_compile": "iree-compile",
         "iree_opt": "iree-opt",
         "iree_import_tflite": "iree-import-tflite",
-        # Conservative RV32 + vector baseline.  Replace these with the exact
-        # flags your Coral NPU SDK's iree-compile wrapper uses.
+        # Conservative RV32 + vector baseline.  This treats the NPU as a
+        # bare-metal llvm-cpu target; it is useful for host-side experiments
+        # but it is NOT the Coral NPU HAL device.  Use --profile coralnpu (or
+        # --config scripts/coralnpu.json) for the real compiler target.
         "compile_flags": [
             "--iree-input-type=tosa",
             "--iree-hal-target-device=local",
@@ -95,6 +97,30 @@ DEFAULTS: dict[str, Any] = {
             "--iree-opt-level=O2",
         ],
     },
+}
+
+#: Target profile for a Coral NPU build of ``coralnpu-compiler``.
+#:
+#: The Coral NPU compiler exposes a dedicated IREE HAL device
+#: (``--iree-hal-target-device=coralnpu``) plus a host llvm-cpu device for
+#: unsupported dispatches.  Its HAL driver executes the resulting module with
+#: ``iree-run-module --device=local-task --device=coralnpu`` (MPACT simulator
+#: by default; both drivers, in module order).  Do not
+#: use the generic ``riscv32-unknown-elf`` llvm-cpu flags from the baseline
+#: profile here: those produce a bare-metal CPU executable, not a module the
+#: Coral NPU runtime can dispatch.
+CORALNPU_TARGET: dict[str, Any] = {
+    "name": "coral-npu",
+    "iree_compile": "iree-compile",
+    "iree_opt": "iree-opt",
+    "iree_import_tflite": "iree-import-tflite",
+    "compile_flags": [
+        "--iree-hal-target-device=local",
+        "--iree-hal-local-target-device-backends=llvm-cpu",
+        "--iree-llvmcpu-target-cpu=host",
+        "--iree-hal-target-device=coralnpu",
+        "--iree-opt-level=O2",
+    ],
 }
 
 TOOL_HINT = (
@@ -417,8 +443,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  %(prog)s model.litertlm --seq-len 128 --budget-bytes 65536\n"
-            "  %(prog)s model.tflite --seq-len 512 --attention-func attn_0 \\\n"
-            "      --q-tile 16 --kv-tile 64 --stop-after attention\n"
+            "  %(prog)s model.tflite --seq-len 512 --profile coralnpu \\\n"
+            "      --attention-func attn_0 --q-tile 16 --kv-tile 64\n"
+            "  %(prog)s model.tflite --seq-len 128 --stop-after attention\n"
         ),
     )
     parser.add_argument(
@@ -499,6 +526,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--print-config", action="store_true", help="print the merged config and exit"
     )
     parser.add_argument("--config", type=Path, help="JSON file overriding the defaults")
+    parser.add_argument(
+        "--profile",
+        choices=["baseline", "coralnpu"],
+        default="baseline",
+        help=(
+            "target profile: 'baseline' is the generic RV32 llvm-cpu fallback; "
+            "'coralnpu' uses the Coral NPU IREE HAL device "
+            "(--iree-hal-target-device=coralnpu)"
+        ),
+    )
     parser.add_argument("--iree-compile", help="path to iree-compile")
     parser.add_argument("--iree-opt", help="path to iree-opt")
     parser.add_argument("--iree-import-tflite", help="path to iree-import-tflite")
@@ -517,6 +554,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def load_config(args: argparse.Namespace) -> dict:
     config = copy.deepcopy(DEFAULTS)
+    # Precedence: defaults < profile < --config < explicit CLI flags.  Applying
+    # the profile first lets a user's config override individual target fields
+    # (for example a vendor iree-compile path) without losing the rest of the
+    # Coral NPU target block.
+    if getattr(args, "profile", "baseline") == "coralnpu":
+        config["target"] = copy.deepcopy(CORALNPU_TARGET)
     if args.config:
         if not args.config.exists():
             die(f"config not found: {args.config}")

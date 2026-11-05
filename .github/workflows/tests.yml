@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q -m "not integration"
+
+  iree-integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12.0 is the release coralnpu-compiler pins, so it is the one the
+        # emitted TOSA must work with.  The current release guards against
+        # writing syntax only that version understands: the two disagree on the
+        # custom assembly of tosa.const_shape, tosa.transpose, tosa.concat, and
+        # tosa.reduce_*, which is why the emitter uses the generic form for
+        # those ops.
+        iree: ["3.12.0", "3.13.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements-dev.txt
+      - run: >-
+          python -m pip install
+          "iree-base-compiler==${{ matrix.iree }}"
+          "iree-base-runtime==${{ matrix.iree }}"
+          iree-tools-tflite
+      - run: python -m pytest -q -m integration

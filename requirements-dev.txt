@@ -1,0 +1,11 @@
+# Test and numerics dependencies.
+#
+# The compiler itself only needs the IREE command line tools:
+#   pip install iree-base-compiler iree-tools-tflite
+#
+# IREE is installed separately and is not pinned here: the test suite runs on
+# both 3.12.0 (the release coralnpu-compiler pins) and the current release.  CI
+# covers both versions; see .github/workflows/tests.yml and the version note in
+# scripts/README.md.
+pytest>=8
+numpy>=1.26

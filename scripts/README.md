@@ -33,8 +33,23 @@ The result is plain TOSA (`tosa.matmul`, `tosa.slice`, `tosa.reduce_*`,
 
   The generated IR targets the current TOSA dialect where shape parameters
   (`slice` starts, `reshape` targets, `tile` multiples, `padding`) are
-  `!tosa.shape` operands produced by `tosa.const_shape`. Use the same IREE
-  release as your Coral NPU SDK; older revisions used attributes instead.
+  `!tosa.shape` operands produced by `tosa.const_shape`.
+
+  The emitter is written to verify on both IREE 3.12 (the release
+  `coralnpu-compiler` pins) and 3.13. Four TOSA custom assemblies changed
+  between those releases — `tosa.const_shape`, `tosa.transpose`,
+  `tosa.concat`, and `tosa.reduce_*` — and each spelling is rejected by the
+  other version, so those ops are emitted in the generic (quoted) form:
+
+  ```mlir
+  %0 = "tosa.const_shape"() {values = dense<[2, 2, 4]> : tensor<3xindex>} : () -> !tosa.shape<3>
+  %1 = "tosa.transpose"(%v) {perms = array<i32: 0, 2, 1>} : (tensor<2x2x4xf32>) -> tensor<2x4x2xf32>
+  ```
+
+  Everything else uses normal custom assembly, which is stable. Prefer the
+  IREE release your Coral NPU SDK uses; older revisions (pre-3.12) used
+  attributes instead of `!tosa.shape` operands, which this emitter does not
+  produce.
 - A LiteRT model: `.tflite`, or a `.litertlm` bundle that contains one.
   You can also feed an already-imported `.mlir` file (useful for iterating).
 
@@ -42,21 +57,22 @@ The result is plain TOSA (`tosa.matmul`, `tosa.slice`, `tosa.reduce_*`,
 
 ```bash
 # 1. See what the importer produced and pick the attention function.
-python scripts/npu/compile_litert.py model.litertlm \
+python scripts/compile_litert.py model.litertlm \
     --seq-len 128 --list-functions
 
 # 2. Tile attention and stop before invoking IREE.
-python scripts/npu/compile_litert.py model.litertlm \
+python scripts/compile_litert.py model.litertlm \
     --seq-len 128 \
     --budget-bytes 262144 \
     --attention-func attention_0 \
     --stop-after attention
 
-# 3. Full pipeline: import, bind, tile, verify, compile.
-python scripts/npu/compile_litert.py model.litertlm \
+# 3. Full pipeline: import, bind, tile, verify, compile for Coral NPU.
+python scripts/compile_litert.py model.litertlm \
     --seq-len 128 \
     --budget-bytes 262144 \
     --attention-func attention_0 \
+    --profile coralnpu \
     --iree-compile /path/to/coralnpu/iree-compile
 ```
 
@@ -64,9 +80,14 @@ python scripts/npu/compile_litert.py model.litertlm \
 is a placeholder: set it to the SRAM/TCM window your Coral NPU build exposes
 to a kernel.
 
-Useful flags: `--q-tile`, `--kv-tile` (force a plan), `--causal`/`--no-causal`,
-`--q-offset`, `--print-plan`, `--print-config`, `--report-tensors`,
-`--dry-run`, `--stop-after {ingest,bind,attention,verify,compile}`.
+Useful flags: `--profile {baseline,coralnpu}`, `--q-tile`, `--kv-tile` (force a
+plan), `--causal`/`--no-causal`, `--q-offset`, `--print-plan`, `--print-config`,
+`--report-tensors`, `--dry-run`,
+`--stop-after {ingest,bind,attention,verify,compile}`.
+
+This is an AOT reference pipeline, not yet a LiteRT accelerator. See
+[`docs/litert-backend.md`](../docs/litert-backend.md) for the Compiler Plugin
+and Dispatch `.so` integration plan.
 
 ## Pipeline
 
@@ -146,7 +167,31 @@ finite instead of producing `0/0`.
 
 ## Targeting the Coral NPU
 
-The default flags are a conservative RV32 + vector baseline:
+There are two target profiles.
+
+**`--profile coralnpu` (recommended).** This is the real Coral NPU IREE HAL
+device used by
+[`coralnpu-compiler`](https://github.com/google-coral/coralnpu-compiler):
+
+```text
+--iree-hal-target-device=local
+--iree-hal-local-target-device-backends=llvm-cpu
+--iree-llvmcpu-target-cpu=host
+--iree-hal-target-device=coralnpu
+--iree-opt-level=O2
+```
+
+It emits host + Coral NPU executables, so the module carries two HAL devices
+and `iree-run-module` needs both drivers in module order:
+`iree-run-module --device=local-task --device=coralnpu --module=model.vmfb`
+(MPACT simulator by default; put the directory containing
+`libcoralnpu_simulator_mpact.so` on `LD_LIBRARY_PATH`), or use the LiteRT
+dispatch library.
+
+**`--profile baseline` (default).** A conservative bare-metal RV32 + vector
+`llvm-cpu` target. It is useful for host-side experiments and for checking the
+generated TOSA without a Coral NPU build, but it does **not** produce a module
+the Coral NPU HAL can dispatch:
 
 ```text
 --iree-input-type=tosa
@@ -162,14 +207,13 @@ The default flags are a conservative RV32 + vector baseline:
 --iree-opt-level=O2
 ```
 
-Coral NPU SDKs ship their own `iree-compile` wrapper with the exact ISA and
-linking flags for the core. Export them with `--print-config`, edit
-`target.compile_flags`, and re-use the file with `--config`:
+To pin the exact ISA/linking flags and memory budget for your SDK, copy the
+example config and edit it:
 
 ```bash
-python scripts/npu/compile_litert.py model.tflite --seq-len 128 --print-config > npu.json
+cp scripts/coralnpu.json npu.json
 # edit npu.json: target.iree_compile, target.compile_flags, memory.tile_bytes
-python scripts/npu/compile_litert.py model.tflite --seq-len 128 --config npu.json
+python scripts/compile_litert.py model.tflite --seq-len 128 --config npu.json
 ```
 
 `{tile_bytes}`, `{stack_bytes}`, and `{required_bytes}` are substituted in
@@ -187,14 +231,35 @@ compile flags.
 ## Testing
 
 ```bash
-python -m pytest tests/test_npu_tiling.py
+pip install -r requirements-dev.txt
+python -m pytest
 ```
 
-The tests cover the planner arithmetic, the emitted IR shape/partitioning,
-dynamic-extent binding, function splicing, and the driver pipeline through the
-attention stage. They do not require IREE. When `iree-opt` is available the
-script runs `--verify-each` on every build, which is what catches dialect
-syntax drift.
+The unit tests need only Python and NumPy. They cover the planner arithmetic,
+the emitted IR shape/partitioning, dynamic-extent binding, function splicing,
+the driver pipeline through the attention stage, and the online-softmax
+recurrence against a NumPy reference.
+
+With IREE on `PATH`, the integration tests additionally run
+`iree-opt --verify-each` on the emitted TOSA and execute the tiled kernel with
+`iree-run-module`, comparing it to NumPy. If the installed `iree-compile`
+exposes `--iree-hal-target-device=coralnpu`, the suite also compiles and runs
+the kernel on the MPACT simulator; otherwise that case is skipped. The simulator
+dylib (`libcoralnpu_simulator_mpact.so`) must be on `LD_LIBRARY_PATH`, and the
+module's two devices mean `iree-run-module` gets both `--device=` flags.
+
+```bash
+pip install iree-base-compiler iree-base-runtime iree-tools-tflite
+python -m pytest tests/test_integration_iree.py
+```
+
+The suite is green on IREE **3.12.0** (the version `coralnpu-compiler` pins)
+and on **3.13.0**; CI runs both (see `.github/workflows/tests.yml`). The
+emitted kernel is identical for both — see the note on generic op syntax under
+[Requirements](#requirements).
+
+`--verify-each` is what catches TOSA dialect drift; the numerical run is what
+catches tile-offset, padding, and causal-mask mistakes.
 
 ## Limits
 
@@ -211,3 +276,6 @@ syntax drift.
   additionally requires exact KV tiles.
 - `.litertlm` extraction is best effort. If the container format changes,
   pass the `.tflite` file directly.
+- This is not yet a LiteRT dispatch backend. The scripts produce a `.vmfb` you
+  can run with `iree-run-module`; the compiler-plugin and dispatch-library work
+  is tracked in [`docs/litert-backend.md`](../docs/litert-backend.md).

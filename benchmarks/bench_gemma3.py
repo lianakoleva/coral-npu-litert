@@ -35,7 +35,9 @@ Results are printed as a table and can be written as JSON with ``--json-out``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import statistics
 import sys
 import time
@@ -68,6 +70,73 @@ def _load_tokenizer(path: str | Path | None):
     except Exception as exc:  # pragma: no cover - optional dependency
         print(f"warning: could not load tokenizer {path}: {exc}", file=sys.stderr)
         return None
+
+
+class _Fd2Capture:
+    """Redirects fd 2 to a temp file so C++/absl logs can be inspected.
+
+    LiteRT logs through the C++ logging macros, which write straight to fd 2;
+    Python-level `redirect_stderr` never sees them.  Capture at the fd level
+    while the engine is being built — that is where the compiler plugin and
+    the dispatch library announce what they decided to do.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._saved = None
+
+    def __enter__(self) -> "_Fd2Capture":
+        self.path.write_text("")
+        self._saved = os.dup(2)
+        fd = os.open(self.path, os.O_WRONLY)
+        os.dup2(fd, 2)
+        os.close(fd)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        sys.stderr.flush()
+        os.dup2(self._saved, 2)
+        self._saved = None
+
+    def nl(self) -> str:
+        return "\n".join(
+            line for line in self.path.read_text(errors="replace").splitlines()
+            if line.startswith("INFO: [") or line.startswith("CoralNPU")
+            or line.startswith("E0") or line.startswith("W0")
+        )
+
+
+def _effective_backend(log: str, requested: str) -> str:
+    """Did the requested backend actually execute, or did LiteRT fall back?
+
+    LiteRT logs `N compiler plugins were applied successfully: ...` per model
+    load; `0` means the Coral NPU compiler plugin failed to compile its
+    partitions and XNNPACK will run the graph.  A `1` plus an `AOT cache hit`
+    means the NPU dispatch path really ran.
+    """
+    if requested != "npu":
+        return requested
+    applied = 0
+    for line in log.splitlines():
+        needle = " compiler plugins were applied successfully"
+        idx = line.find(needle)
+        if idx > 0:
+            digits = ""
+            for ch in reversed(line[:idx]):
+                if ch.isdigit():
+                    digits = ch + digits
+                elif digits:
+                    break
+            if digits.isdigit():
+                applied = int(digits)
+    npu_ran = "AOT cache hit" in log
+    if applied >= 1 and npu_ran:
+        return "npu"
+    return "cpu-fallback"
+
+
+def plugins_were_applied_token(line: str) -> bool:
+    return " compiler plugins were applied successfully: " in line
 
 
 def _count_tokens(text: str, tokenizer, fallback: int | None = None) -> int:
@@ -169,9 +238,39 @@ def _run_litert(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[st
         backend = litert_lm.Backend.CPU(thread_count=args.threads)
         backend_label = "cpu"
 
+    capture_log = Path(args.npu_log) if args.npu_log else None
+    if args.backend == "litert-npu" and (args.require_npu or capture_log):
+        capture = _Fd2Capture(capture_log or "bench_npulog.tmp")
+    else:
+        capture = None
+
     started = time.perf_counter()
-    engine = litert_lm.Engine(args.model, backend=backend)
+    if capture is not None:
+        with capture as cap:
+            engine = litert_lm.Engine(args.model, backend=backend)
+        log = cap.nl()
+    else:
+        engine = litert_lm.Engine(args.model, backend=backend)
     load_s = time.perf_counter() - started
+
+    if capture is not None:
+        effective = _effective_backend(log, args.backend)
+        if capture_log:
+            capture_log.write_text(log + "\n")
+        else:
+            capture.path.unlink(missing_ok=True)
+        if effective != args.backend:
+            print(
+                "warning: backend '%s' was requested but the model loaded on "
+                "the CPU (LiteRT fell back); see --npu-log for the plugin "
+                "log; --require-npu fails instead" % args.backend,
+                file=sys.stderr,
+            )
+            if args.require_npu:
+                raise SystemExit(
+                    "error: NPU backend did not engage; refusing to report "
+                    "CPU numbers as NPU results"
+                )
 
     tokenizer = _load_tokenizer(args.tokenizer)
     print(
@@ -216,7 +315,11 @@ def _run_litert(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[st
             f"tokens={sample['tokens']}",
             flush=True,
         )
-    return samples, {"load_s": round(load_s, 3), "requested_backend": backend_label}
+    return samples, {
+        "load_s": round(load_s, 3),
+        "requested_backend": backend_label,
+        "backend_effective": effective if capture is not None else backend_label,
+    }
 
 
 def _summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -290,6 +393,17 @@ def main() -> None:
     litert.add_argument(
         "--dispatch-lib-dir",
         help="directory with libLiteRtDispatch_*.so (litert-npu)",
+    )
+    litert.add_argument(
+        "--npu-log",
+        help="write the LiteRT plugin/dispatch log captured during engine "
+        "load to this file (litert-npu)",
+    )
+    litert.add_argument(
+        "--require-npu",
+        action="store_true",
+        help="fail instead of quietly benchmarking the CPU when the "
+        "litert-npu backend does not engage (litert-npu)",
     )
 
     args = parser.parse_args()

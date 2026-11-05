@@ -9,7 +9,7 @@ causal mask alignment.
 
 Requirements: ``iree-base-compiler``, ``iree-base-runtime``, ``numpy``.
 
-    python scripts/npu/check_attention_numerics.py --seq 5 --kv-seq 7 \\
+    python scripts/check_attention_numerics.py --seq 5 --kv-seq 7 \\
         --q-tile 4 --kv-tile 4 --causal
 """
 
